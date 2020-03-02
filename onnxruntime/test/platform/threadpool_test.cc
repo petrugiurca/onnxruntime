@@ -34,40 +34,35 @@ void IncrementElement(TestData& test_data, int i) {
 }
 
 void ValidateTestData(TestData& test_data) {
-  ASSERT_TRUE(std::count_if(test_data.data.cbegin(),
-                            test_data.data.cend(),
-                            [](int i) { return i != 1; }) == 0);
+  ASSERT_TRUE(std::count_if(test_data.data.cbegin(), test_data.data.cend(), [](int i) { return i != 1; }) == 0);
 }
 
-void CreateThreadPoolAndTest(const std::string& name, int num_threads, const std::function<void(ThreadPool*)>& test_body) {
-  auto tp = onnxruntime::make_unique<ThreadPool>(name, num_threads);
+void CreateThreadPoolAndTest(const std::string&, int num_threads, const std::function<void(ThreadPool*)>& test_body) {
+  auto tp = onnxruntime::make_unique<ThreadPool>(&onnxruntime::Env::Default(), ThreadOptions(), "", num_threads, true);
   test_body(tp.get());
 }
 
 void TestParallelFor(const std::string& name, int num_threads, int num_tasks) {
   auto test_data = CreateTestData(num_tasks);
   CreateThreadPoolAndTest(name, num_threads, [&](ThreadPool* tp) {
-    tp->ParallelFor(num_tasks, [&](int i) {
-      IncrementElement(*test_data, i);
-    });
+    tp->ParallelFor(num_tasks, [&](int i) { IncrementElement(*test_data, i); });
   });
   ValidateTestData(*test_data);
 }
 
 void TestBatchParallelFor(const std::string& name, int num_threads, int num_tasks, int batch_size) {
   auto test_data = CreateTestData(num_tasks);
+
   CreateThreadPoolAndTest(name, num_threads, [&](ThreadPool* tp) {
-    tp->BatchParallelFor(
-        num_tasks, [&](int i) {
-          IncrementElement(*test_data, i);
-        },
-        batch_size);
+    onnxruntime::concurrency::ThreadPool::TryBatchParallelFor(
+        tp, num_tasks, [&](int i) { IncrementElement(*test_data, i); }, batch_size);
   });
   ValidateTestData(*test_data);
 }
 
 }  // namespace
 
+namespace onnxruntime {
 TEST(ThreadPoolTest, TestParallelFor_2_Thread_NoTask) {
   TestParallelFor("TestParallelFor_2_Thread_NoTask", 2, 0);
 }
@@ -99,3 +94,30 @@ TEST(ThreadPoolTest, TestBatchParallelFor_2_Thread_50_Task_100_Batch) {
 TEST(ThreadPoolTest, TestBatchParallelFor_2_Thread_81_Task_20_Batch) {
   TestBatchParallelFor("TestBatchParallelFor_2_Thread_81_Task_20_Batch", 2, 81, 20);
 }
+
+// Sadly, Eigen threadpool doesn't support nested parallelFor. Java can do it, C# can do it, TBB can do it,
+// but not Eigen.
+// TEST(ThreadPoolTest, Nested) {
+//  onnxruntime::concurrency::ThreadPool::ThreadEnvironment tp_env;
+//  const int num_threads = 10;
+//  ThreadPool tp(num_threads, true, tp_env);
+//  Barrier b(num_threads*2);
+//  tp.parallelFor(num_threads*2,
+//                 Eigen::TensorOpCost(std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+//                                     std::numeric_limits<float>::max()),
+//                 [num_threads,&b,&tp](Eigen::Index start, Eigen::Index end) {
+//                   ASSERT_EQ(start + 1, end);
+//                   b.Notify();
+//                   b.Wait();
+//                   b.Notify();
+//                   tp.parallelFor(
+//                       num_threads*2,
+//                       Eigen::TensorOpCost(std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+//                                           std::numeric_limits<float>::max()),
+//                       [](Eigen::Index start, Eigen::Index end) {
+//                         std::cout << "Test output from nested loop" << std::endl;
+//                       });
+//                 });
+//}
+
+}  // namespace onnxruntime

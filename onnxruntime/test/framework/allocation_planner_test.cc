@@ -165,7 +165,7 @@ class PlannerTest : public ::testing::Test {
   PlannerTest()
       : model_("test", false, DefaultLoggingManager().DefaultLogger()),
         graph_(model_.MainGraph()),
-        tp_("test", 1),
+        tp_(&onnxruntime::Env::Default(), concurrency::ThreadOptions(), "", 2, true),
         state_(execution_providers_, false, &tp_, nullptr) {
     std_kernel_ = KernelDefBuilder().SetName("Transpose").Provider(kCpuExecutionProvider).SinceVersion(1, 10).Build();
     in_place_kernel_ =
