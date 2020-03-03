@@ -21,30 +21,92 @@ limitations under the License.
 #endif
 #include "core/util/eigen_common_wrapper.h"
 #include "core/platform/EigenNonBlockingThreadPool.h"
+#include "core/platform/ort_mutex.h"
 
 namespace onnxruntime {
+namespace {
+class BlockingCounter {
+ public:
+  BlockingCounter(int initial_count) : state_(initial_count << 1), notified_(false) {
+    ORT_ENFORCE(initial_count >= 0);
+#ifndef NDEBUG
+    ORT_ENFORCE(((initial_count << 1) >> 1) == initial_count);
+#endif
+  }
+
+  ~BlockingCounter() {
+  }
+
+  inline void DecrementCount() {
+    unsigned int v = state_.fetch_sub(2, std::memory_order_acq_rel) - 2;
+    if (v != 1) {
+#ifndef NDEBUG
+      ORT_ENFORCE(((v + 2) & ~1) != 0);
+#endif
+      return;  // either count has not dropped to 0, or waiter is not waiting
+    }
+    std::lock_guard<OrtMutex> l(mu_);
+    notified_ = true;
+    cond_var_.notify_all();
+  }
+
+  inline void Wait() {
+    unsigned int v = state_.fetch_or(1, std::memory_order_acq_rel);
+    if ((v >> 1) == 0)
+      return;
+    std::unique_lock<OrtMutex> l(mu_);
+    while (!notified_) {
+      cond_var_.wait(l);
+    }
+  }
+  // Wait for the specified time, return false iff the count has not dropped to
+  // zero before the timeout expired.
+  inline bool WaitFor(std::chrono::milliseconds ms) {
+    unsigned int v = state_.fetch_or(1, std::memory_order_acq_rel);
+    if ((v >> 1) == 0)
+      return true;
+    std::unique_lock<OrtMutex> l(mu_);
+    while (!notified_) {
+      const std::cv_status status = cond_var_.wait_for(l, ms);
+      if (status == std::cv_status::timeout) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+ private:
+  OrtMutex mu_;
+  OrtCondVar cond_var_;
+  std::atomic<int> state_;  // low bit is waiter flag
+  bool notified_;
+};
+}  // namespace
 namespace concurrency {
 
-ThreadPool::ThreadPool(Env* env, const std::string& name, int num_threads)
-    : ThreadPool(env, ThreadOptions(), name, num_threads, true, nullptr) {
+ThreadPool::ThreadPool(Env* env, const NAME_CHAR_TYPE* name, int num_threads, Eigen::Allocator* allocator)
+    : ThreadPool(env, ThreadOptions(), name, num_threads, true, allocator) {
 }
 
-ThreadPool::ThreadPool(Env* env, const ThreadOptions& thread_options, const std::string& name, int num_threads)
-    : ThreadPool(env, thread_options, name, num_threads, true, nullptr) {
+ThreadPool::ThreadPool(Env* env, const ThreadOptions& thread_options, const NAME_CHAR_TYPE* name, int num_threads,
+                       Eigen::Allocator* allocator)
+    : ThreadPool(env, thread_options, name, num_threads, true, allocator) {
 }
 
-ThreadPool::ThreadPool(Env* env, const ThreadOptions& /*thread_options*/, const std::string& /*name*/, int num_threads,
-                       bool low_latency_hint, Eigen::Allocator* allocator) {
+ThreadPool::ThreadPool(Env* env, const ThreadOptions& thread_options, const NAME_CHAR_TYPE* name, int num_threads,
+                       bool low_latency_hint, Eigen::Allocator* allocator)
+    : thread_options_(thread_options) {
   ORT_ENFORCE(num_threads >= 1);
-  eigen_threadpool_.reset(new ThreadPoolTempl<Env>(num_threads, low_latency_hint, *env));
+  eigen_threadpool_.reset(new ThreadPoolTempl<Env>(name, num_threads, low_latency_hint, *env, thread_options_));
   underlying_threadpool_ = eigen_threadpool_.get();
   threadpool_device_.reset(new Eigen::ThreadPoolDevice(underlying_threadpool_, num_threads, allocator));
 }
 
-ThreadPool::ThreadPool(Eigen::ThreadPoolInterface* user_threadpool) {
+ThreadPool::ThreadPool(Eigen::ThreadPoolInterface* user_threadpool, Eigen::Allocator* allocator)
+    : thread_options_(ThreadOptions()) {
   underlying_threadpool_ = user_threadpool;
   threadpool_device_.reset(
-      new Eigen::ThreadPoolDevice(underlying_threadpool_, underlying_threadpool_->NumThreads(), nullptr));
+      new Eigen::ThreadPoolDevice(underlying_threadpool_, underlying_threadpool_->NumThreads(), allocator));
 }
 
 ThreadPool::~ThreadPool() {

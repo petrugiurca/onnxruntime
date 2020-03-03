@@ -170,16 +170,29 @@ void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
   graph_transformation_mgr_ =
       onnxruntime::make_unique<GraphTransformerManager>(session_options_.max_num_graph_transformation_steps);
   logging_manager_ = logging_manager;
-  concurrency::ThreadOptions to;
-  thread_pool_ = concurrency::CreateThreadPool(session_options_.intra_op_num_threads, const_cast<Env*>(&Env::Default()),
-                                               to, "intra_op", session_options_.thread_pool_allow_spinning, nullptr);
-
-  inter_op_thread_pool_ =
-      session_options_.execution_mode == ExecutionMode::ORT_PARALLEL ?
-          concurrency::CreateThreadPool(session_options_.inter_op_num_threads, const_cast<Env*>(&Env::Default()), to,
-                                        "intra_op", session_options_.thread_pool_allow_spinning, nullptr) :
-          nullptr;
-
+  {
+    ThreadOptions to;
+    // If the thread pool can use all the processors, then
+    // we set thread affinity.
+    if (session_options_.intra_op_num_threads == 0 && session_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL)
+      to.SetThreadAffinityToProcessor = true;
+    else
+      to.SetThreadAffinityToProcessor = false;
+    to.StackSize = session_options_.stack_size;
+    thread_pool_ =
+        concurrency::CreateThreadPool(session_options_.intra_op_num_threads, &Env::Default(), to, ORT_TSTR("intra-op"),
+                                      session_options_.thread_pool_allow_spinning, nullptr);
+  }
+  {
+    ThreadOptions to;
+    to.SetThreadAffinityToProcessor = false;
+    to.StackSize = session_options_.stack_size;
+    inter_op_thread_pool_ =
+        session_options_.execution_mode == ExecutionMode::ORT_PARALLEL ?
+            concurrency::CreateThreadPool(session_options_.inter_op_num_threads, &Env::Default(), to,
+                                          ORT_TSTR("intra-op"), session_options_.thread_pool_allow_spinning, nullptr) :
+            nullptr;
+  }
   session_state_ = onnxruntime::make_unique<SessionState>(
       execution_providers_,
       session_options_.enable_mem_pattern && session_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL,

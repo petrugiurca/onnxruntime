@@ -66,5 +66,6 @@ struct SessionOptions {
   std::vector<FreeDimensionOverride> free_dimension_overrides;
 
   bool thread_pool_allow_spinning = true;
+  unsigned int stack_size = 0;
 };
 }  // namespace onnxruntime

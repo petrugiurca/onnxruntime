@@ -18,7 +18,6 @@ limitations under the License.
 #include <vector>
 #include <functional>
 #include <memory>
-#include "ort_mutex.h"
 #include <atomic>
 #include "core/common/common.h"
 #include "core/platform/env.h"
@@ -46,66 +45,6 @@ struct TensorOpCost {
 template <typename Environment>
 class ThreadPoolTempl;
 namespace concurrency {
-
-struct ThreadOptions {};
-
-class BlockingCounter {
- public:
-  BlockingCounter(int initial_count) : state_(initial_count << 1), notified_(false) {
-    ORT_ENFORCE(initial_count >= 0);
-#ifndef NDEBUG
-    ORT_ENFORCE(((initial_count << 1) >> 1) == initial_count);
-#endif
-  }
-
-  ~BlockingCounter() {
-  }
-
-  inline void DecrementCount() {
-    unsigned int v = state_.fetch_sub(2, std::memory_order_acq_rel) - 2;
-    if (v != 1) {
-#ifndef NDEBUG
-      ORT_ENFORCE(((v + 2) & ~1) != 0);
-#endif
-      return;  // either count has not dropped to 0, or waiter is not waiting
-    }
-    std::lock_guard<OrtMutex> l(mu_);
-    notified_ = true;
-    cond_var_.notify_all();
-  }
-
-  inline void Wait() {
-    unsigned int v = state_.fetch_or(1, std::memory_order_acq_rel);
-    if ((v >> 1) == 0)
-      return;
-    std::unique_lock<OrtMutex> l(mu_);
-    while (!notified_) {
-      cond_var_.wait(l);
-    }
-  }
-  // Wait for the specified time, return false iff the count has not dropped to
-  // zero before the timeout expired.
-  inline bool WaitFor(std::chrono::milliseconds ms) {
-    unsigned int v = state_.fetch_or(1, std::memory_order_acq_rel);
-    if ((v >> 1) == 0)
-      return true;
-    std::unique_lock<OrtMutex> l(mu_);
-    while (!notified_) {
-      const std::cv_status status = cond_var_.wait_for(l, ms);
-      if (status == std::cv_status::timeout) {
-        return false;
-      }
-    }
-    return true;
-  }
-
- private:
-  OrtMutex mu_;
-  OrtCondVar cond_var_;
-  std::atomic<int> state_;  // low bit is waiter flag
-  bool notified_;
-};
-
 class ThreadPool {
  public:
   // Scheduling strategies for ParallelFor. The strategy governs how the given
@@ -169,6 +108,11 @@ class ThreadPool {
     // scheduling strategy.
     optional<int64_t> block_size_;
   };
+#ifdef _WIN32
+  using NAME_CHAR_TYPE = wchar_t;
+#else
+  using NAME_CHAR_TYPE = char;
+#endif
   // Constructs a pool that contains "num_threads" threads with specified
   // "name". env->StartThread() is used to create individual threads with the
   // given ThreadOptions. If "low_latency_hint" is true the thread pool
@@ -178,23 +122,24 @@ class ThreadPool {
   // operations like I/O the hint should be set to false.
   //
   // REQUIRES: num_threads > 0
-  ThreadPool(Env* env, const ThreadOptions& thread_options, const std::string& name, int num_threads,
+  ThreadPool(Env* env, const ThreadOptions& thread_options, const NAME_CHAR_TYPE* name, int num_threads,
              bool low_latency_hint, Eigen::Allocator* allocator = nullptr);
   // Constructs a pool for low-latency ops that contains "num_threads" threads
   // with specified "name". env->StartThread() is used to create individual
   // threads.
   // REQUIRES: num_threads > 0
-  ThreadPool(Env* env, const std::string& name, int num_threads);
+  ThreadPool(Env* env, const NAME_CHAR_TYPE* name, int num_threads, Eigen::Allocator* allocator);
   // Constructs a pool for low-latency ops that contains "num_threads" threads
   // with specified "name". env->StartThread() is used to create individual
   // threads with the given ThreadOptions.
   // REQUIRES: num_threads > 0
-  ThreadPool(Env* env, const ThreadOptions& thread_options, const std::string& name, int num_threads);
+  ThreadPool(Env* env, const ThreadOptions& thread_options, const NAME_CHAR_TYPE* name, int num_threads,
+             Eigen::Allocator* allocator);
   // Constructs a pool that wraps around the thread::ThreadPoolInterface
   // instance provided by the caller. Caller retains ownership of
   // `user_threadpool` and must ensure its lifetime is longer than the
   // ThreadPool instance.
-  explicit ThreadPool(Eigen::ThreadPoolInterface* user_threadpool);
+  ThreadPool(Eigen::ThreadPoolInterface* user_threadpool, Eigen::Allocator* allocator);
 
   // Waits until all scheduled work has finished and then destroy the
   // set of threads.
@@ -337,6 +282,7 @@ Tries to call the given function in parallel, with calls split into (num_batches
   // Requires 0 < block_size <= total.
   void ParallelForFixedBlockSizeScheduling(const int64_t total, const int64_t block_size,
                                            const std::function<void(int64_t, int64_t)>& fn);
+  const ThreadOptions& thread_options_;
   // underlying_threadpool_ is the user_threadpool if user_threadpool is
   // provided in the constructor. Otherwise it is the eigen_threadpool_.
   Eigen::ThreadPoolInterface* underlying_threadpool_;

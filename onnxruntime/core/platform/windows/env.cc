@@ -38,30 +38,34 @@ namespace {
 
 struct FileHandleTraits {
   using Handle = HANDLE;
-  static Handle GetInvalidHandleValue() noexcept { return INVALID_HANDLE_VALUE; }
+  static Handle GetInvalidHandleValue() noexcept {
+    return INVALID_HANDLE_VALUE;
+  }
   static void CleanUp(Handle h) noexcept {
     if (!CloseHandle(h)) {
       const int err = GetLastError();
-      //It indicates potential data loss
+      // It indicates potential data loss
       LOGS_DEFAULT(ERROR) << "Failed to close file handle - error code: " << err;
     }
   }
 };
 
-// EnvThread constructor must start the thread,
-// destructor must join the thread.
 class WindowsThread : public EnvThread {
  private:
   struct Param {
+    const ORTCHAR_T* name_prefix;
     int index;
     unsigned (*start_address)(int id, Eigen::ThreadPoolInterface* param);
     Eigen::ThreadPoolInterface* param;
+    const ThreadOptions& thread_options;
   };
 
  public:
-  WindowsThread(int index, unsigned (*start_address)(int id, Eigen::ThreadPoolInterface* param),
-                Eigen::ThreadPoolInterface* param) {
-    hThread = (HANDLE)_beginthreadex(nullptr, 0, ThreadMain, new Param{index, start_address, param}, 0, &threadID);
+  WindowsThread(const ORTCHAR_T* name_prefix, int index,
+                unsigned (*start_address)(int id, Eigen::ThreadPoolInterface* param), Eigen::ThreadPoolInterface* param,
+                const ThreadOptions& thread_options) {
+    hThread = (HANDLE)_beginthreadex(nullptr, thread_options.StackSize, ThreadMain,
+                                     new Param{name_prefix, index, start_address, param, thread_options}, 0, &threadID);
   }
 
   ~WindowsThread() {
@@ -73,9 +77,25 @@ class WindowsThread : public EnvThread {
   }
 
  private:
+  typedef HRESULT(WINAPI* SetThreadDescriptionFunc)(HANDLE hThread, PCWSTR lpThreadDescription);
   static unsigned __stdcall ThreadMain(void* param) {
     Param* p = (Param*)param;
-    SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << p->index);
+    // TODO: should I try to use SetThreadSelectedCpuSets?
+    if (p->thread_options.SetThreadAffinityToProcessor)
+      SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << p->index);
+    // kernel32.dll is always loaded
+    SetThreadDescription(GetCurrentThread(), L"");
+    SetThreadDescriptionFunc pSetThrDesc =
+        (SetThreadDescriptionFunc)GetProcAddress(GetModuleHandle(TEXT("kernel32.dll")), "SetThreadDescription");
+    if (pSetThrDesc != nullptr) {
+      const ORTCHAR_T* name_prefix =
+          (p->name_prefix == nullptr || wcslen(p->name_prefix) == 0) ? L"onnxruntime" : p->name_prefix;
+      std::wostringstream oss;
+      oss << name_prefix << "-" << p->index;
+      // Ignore the error
+      (void)pSetThrDesc(GetCurrentThread(), oss.str().c_str());
+    }
+
     unsigned ret = 0;
     try {
       ret = p->start_address(p->index, p->param);
@@ -95,9 +115,10 @@ using ScopedFileHandle = ScopedResource<FileHandleTraits>;
 
 class WindowsEnv : public Env {
  public:
-  EnvThread* CreateThread(int index, unsigned (*start_address)(int id, Eigen::ThreadPoolInterface* param),
-                          Eigen::ThreadPoolInterface* param) {
-    return new WindowsThread(index, start_address, param);
+  EnvThread* CreateThread(const ORTCHAR_T* name_prefix, int index,
+                          unsigned (*start_address)(int id, Eigen::ThreadPoolInterface* param),
+                          Eigen::ThreadPoolInterface* param, const ThreadOptions& thread_options) {
+    return new WindowsThread(name_prefix, index, start_address, param, thread_options);
   }
   Task CreateTask(std::function<void()> f) {
     return Task{std::move(f)};
@@ -106,7 +127,9 @@ class WindowsEnv : public Env {
     t.f();
   }
 
-  void SleepForMicroseconds(int64_t micros) const override { Sleep(static_cast<DWORD>(micros) / 1000); }
+  void SleepForMicroseconds(int64_t micros) const override {
+    Sleep(static_cast<DWORD>(micros) / 1000);
+  }
 
   int GetNumCpuCores() const override {
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION buffer[256];
@@ -128,7 +151,8 @@ class WindowsEnv : public Env {
         ++processorCoreCount;
       }
     }
-    if (!processorCoreCount) ORT_THROW("Fatal error: 0 count processors from GetLogicalProcessorInformation");
+    if (!processorCoreCount)
+      ORT_THROW("Fatal error: 0 count processors from GetLogicalProcessorInformation");
     return processorCoreCount;
   }
 
@@ -142,8 +166,8 @@ class WindowsEnv : public Env {
   }
 
   Status GetFileLength(const ORTCHAR_T* file_path, size_t& length) const override {
-    ScopedFileHandle file_handle{CreateFileW(
-        file_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)};
+    ScopedFileHandle file_handle{
+        CreateFileW(file_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)};
     LARGE_INTEGER filesize;
     if (!GetFileSizeEx(file_handle.Get(), &filesize)) {
       const int err = GetLastError();
@@ -156,21 +180,21 @@ class WindowsEnv : public Env {
     return Status::OK();
   }
 
-  Status ReadFileIntoBuffer(
-      const ORTCHAR_T* const file_path, const FileOffsetType offset, const size_t length,
-      const gsl::span<char> buffer) const override {
+  Status ReadFileIntoBuffer(const ORTCHAR_T* const file_path, const FileOffsetType offset, const size_t length,
+                            const gsl::span<char> buffer) const override {
     ORT_RETURN_IF_NOT(file_path);
     ORT_RETURN_IF_NOT(offset >= 0);
     ORT_RETURN_IF_NOT(length <= buffer.size());
 
-    ScopedFileHandle file_handle{CreateFileW(
-        file_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)};
+    ScopedFileHandle file_handle{
+        CreateFileW(file_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)};
     if (!file_handle.IsValid()) {
       const int err = GetLastError();
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "open file ", ToMBString(file_path), " fail, errcode = ", err);
     }
 
-    if (length == 0) return Status::OK();
+    if (length == 0)
+      return Status::OK();
 
     if (offset > 0) {
       LARGE_INTEGER current_position;
@@ -188,8 +212,7 @@ class WindowsEnv : public Env {
       const DWORD bytes_to_read = static_cast<DWORD>(std::min<size_t>(bytes_remaining, k_max_bytes_to_read));
       DWORD bytes_read;
 
-      if (!ReadFile(
-              file_handle.Get(), buffer.data() + total_bytes_read, bytes_to_read, &bytes_read, nullptr)) {
+      if (!ReadFile(file_handle.Get(), buffer.data() + total_bytes_read, bytes_to_read, &bytes_read, nullptr)) {
         const int err = GetLastError();
         return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "ReadFile ", ToMBString(file_path), " fail, errcode = ", err);
       }
@@ -204,9 +227,7 @@ class WindowsEnv : public Env {
     return Status::OK();
   }
 
-  Status MapFileIntoMemory(
-      const ORTCHAR_T*, FileOffsetType, size_t,
-      MappedMemoryPtr&) const override {
+  Status MapFileIntoMemory(const ORTCHAR_T*, FileOffsetType, size_t, MappedMemoryPtr&) const override {
     return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "MapFileIntoMemory is not implemented on Windows.");
   }
 
@@ -219,7 +240,8 @@ class WindowsEnv : public Env {
   }
 
   common::Status FileOpenWr(const std::wstring& path, /*out*/ int& fd) const override {
-    _wsopen_s(&fd, path.c_str(), _O_CREAT | _O_TRUNC | _O_SEQUENTIAL | _O_BINARY | _O_WRONLY, _SH_DENYWR, _S_IREAD | _S_IWRITE);
+    _wsopen_s(&fd, path.c_str(), _O_CREAT | _O_TRUNC | _O_SEQUENTIAL | _O_BINARY | _O_WRONLY, _SH_DENYWR,
+              _S_IREAD | _S_IWRITE);
     if (0 > fd) {
       return common::Status(common::SYSTEM, errno);
     }
@@ -235,7 +257,8 @@ class WindowsEnv : public Env {
   }
 
   common::Status FileOpenWr(const std::string& path, /*out*/ int& fd) const override {
-    _sopen_s(&fd, path.c_str(), _O_CREAT | _O_TRUNC | _O_SEQUENTIAL | _O_BINARY | _O_WRONLY, _SH_DENYWR, _S_IREAD | _S_IWRITE);
+    _sopen_s(&fd, path.c_str(), _O_CREAT | _O_TRUNC | _O_SEQUENTIAL | _O_BINARY | _O_WRONLY, _SH_DENYWR,
+             _S_IREAD | _S_IWRITE);
     if (0 > fd) {
       return common::Status(common::SYSTEM, errno);
     }
@@ -309,16 +332,14 @@ class WindowsEnv : public Env {
   }
 
  private:
-  WindowsEnv()
-      : GetSystemTimePreciseAsFileTime_(nullptr) {
+  WindowsEnv() : GetSystemTimePreciseAsFileTime_(nullptr) {
     // GetSystemTimePreciseAsFileTime function is only available in the latest
     // versions of Windows. For that reason, we try to look it up in
     // kernel32.dll at runtime and use an alternative option if the function
     // is not available.
     HMODULE module = GetModuleHandleW(L"kernel32.dll");
     if (module != nullptr) {
-      auto func = (FnGetSystemTimePreciseAsFileTime)GetProcAddress(
-          module, "GetSystemTimePreciseAsFileTime");
+      auto func = (FnGetSystemTimePreciseAsFileTime)GetProcAddress(module, "GetSystemTimePreciseAsFileTime");
       GetSystemTimePreciseAsFileTime_ = func;
     }
   }

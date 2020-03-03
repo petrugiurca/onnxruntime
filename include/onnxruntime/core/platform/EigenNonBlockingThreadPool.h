@@ -45,6 +45,7 @@
 #elif defined(_MSC_VER)
 #pragma warning(pop)
 #endif
+#include "core/platform/ort_mutex.h"
 
 namespace onnxruntime {
 class Barrier {
@@ -529,8 +530,13 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
  public:
   typedef typename Environment::Task Task;
   typedef RunQueue<Task, 1024> Queue;
-
-  ThreadPoolTempl(int num_threads, bool allow_spinning, Environment& env)
+#ifdef _WIN32
+  using CHAR_TYPE = wchar_t;
+#else
+  using CHAR_TYPE = char;
+#endif
+  ThreadPoolTempl(const CHAR_TYPE* name, int num_threads, bool allow_spinning, Environment& env,
+                  const ThreadOptions& thread_options)
       : env_(env),
         num_threads_(num_threads),
         allow_spinning_(allow_spinning),
@@ -560,7 +566,7 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
     thread_data_.resize(num_threads_);
     for (int i = 0; i < num_threads_; i++) {
       SetStealPartition(i, EncodePartition(0, num_threads_));
-      thread_data_[i].thread.reset(env_.CreateThread(i, WorkerLoop, this));
+      thread_data_[i].thread.reset(env_.CreateThread(name, i, WorkerLoop, this, thread_options));
     }
   }
 
