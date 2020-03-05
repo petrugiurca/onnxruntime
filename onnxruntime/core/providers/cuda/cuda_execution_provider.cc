@@ -48,10 +48,10 @@ ONNX_OPERATOR_KERNEL_EX(
 thread_local std::unique_ptr<CUDAExecutionProvider::PerThreadContextMap> CUDAExecutionProvider::per_thread_context_map_;
 
 #if defined(_WIN32)
-// On Windows, CUDA would clean up its internal states upon DLL_DETACH_THREAD
+// On Windows, CUDA would clean up its internal states upon DLL_PROCESS_DETACH
 // and after that calling any cuda/cublas/cudnn APIs would crash
 // use g_cuda_detached to avoid that crash
-// g_cuda_detached is set to true when DLL_DETACH_THREAD happened
+// g_cuda_detached is set to true when DLL_PROCESS_DETACH happened
 bool g_cuda_detached = false;
 #endif
 

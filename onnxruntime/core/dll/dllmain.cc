@@ -46,16 +46,15 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/,
   switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
     case DLL_THREAD_ATTACH:
-      break;
     case DLL_THREAD_DETACH:
+      break;
+    case DLL_PROCESS_DETACH:
 #if defined(_WIN32) && defined(USE_CUDA)
-      // CUDA does some internal clean-up upon DLL_THREAD_DETACH
+      // CUDA does some internal clean-up upon DLL_PROCESS_DETACH
       // and calling cuda APIs after that would cause crash
       // use a global bool to stop that crash-on-exit
       onnxruntime::g_cuda_detached = true;
 #endif
-      break;
-    case DLL_PROCESS_DETACH:
       //TODO: Don't do it when Protobuf_USE_STATIC_LIBS is OFF
       ::google::protobuf::ShutdownProtobufLibrary();
       break;
