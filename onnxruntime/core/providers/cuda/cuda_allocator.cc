@@ -42,7 +42,15 @@ void* CUDAAllocator::Alloc(size_t size) {
   return p;
 }
 
+#ifdef _WIN32
+extern bool g_cuda_detached;
+#endif
+
 void CUDAAllocator::Free(void* p) {
+#ifdef _WIN32
+  if (g_cuda_detached)
+    return;
+#endif
   CheckDevice(false);  // ignore CUDA failure when free
   cudaFree(p);         // do not throw error since it's OK for cudaFree to fail during shutdown
 }

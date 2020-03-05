@@ -47,6 +47,14 @@ ONNX_OPERATOR_KERNEL_EX(
 
 thread_local std::unique_ptr<CUDAExecutionProvider::PerThreadContextMap> CUDAExecutionProvider::per_thread_context_map_;
 
+#if defined(_WIN32)
+// On Windows, CUDA would clean up its internal states upon DLL_DETACH_THREAD
+// and after that calling any cuda/cublas/cudnn APIs would crash
+// use g_cuda_detached to avoid that crash
+// g_cuda_detached is set to true when DLL_DETACH_THREAD happened
+bool g_cuda_detached = false;
+#endif
+
 CUDAExecutionProvider::PerThreadContext::PerThreadContext(OrtDevice::DeviceId device_id, size_t cuda_mem_limit) {
   CUDA_CALL_THROW(cudaSetDevice(device_id));
   CUBLAS_CALL_THROW(cublasCreate(&cublas_handle_));
@@ -63,6 +71,13 @@ CUDAExecutionProvider::PerThreadContext::~PerThreadContext() {
   // dtor shouldn't throw. if something went wrong earlier (e.g. out of CUDA memory) the handles
   // here may be bad, and the destroy calls can throw.
   // https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#Rc-dtor-noexcept
+
+#if defined(_WIN32)
+  // if cuda already cleaned up, don't call any cuda APIs
+  if (g_cuda_detached)
+    return;
+#endif
+
   try {
     CUBLAS_CALL(cublasDestroy(cublas_handle_));
   } catch (const std::exception& ex) {
